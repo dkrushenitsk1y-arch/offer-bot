@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import shutil
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +12,7 @@ from dotenv import load_dotenv
 
 import httpx
 import pytesseract
+import fitz
 from openai import OpenAI
 from fastapi import FastAPI, Request, Header, HTTPException, status, BackgroundTasks
 from PIL import Image
@@ -22,6 +24,7 @@ load_dotenv(dotenv_path=env_path)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://.../telegram/webhook
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # random string
+GOOGLE_SHEETS_WEBHOOK_URL = os.getenv("GOOGLE_SHEETS_WEBHOOK_URL")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
@@ -89,10 +92,13 @@ def health():
 
 @app.get("/debug/config")
 def debug_config():
+    token_preview = (BOT_TOKEN or "")[:10]
     return {
         "webhook_url": WEBHOOK_URL,
         "has_bot_token": bool(BOT_TOKEN),
+        "first_10_chars_of_bot_token": token_preview + ("..." if BOT_TOKEN and len(BOT_TOKEN) > 10 else ""),
         "has_webhook_secret": bool(WEBHOOK_SECRET),
+        "has_google_sheets_webhook_url": bool(GOOGLE_SHEETS_WEBHOOK_URL),
         "tesseract_cmd": TESSERACT_CMD,
     }
 
@@ -220,15 +226,37 @@ async def save_telegram_file(file_id: str, preferred_name: str | None) -> Path:
     return dest
 
 
-def extract_text_from_pdf(path: Path) -> str:
+def extract_text_from_pdf_with_ocr(path: Path) -> str:
     reader = PdfReader(str(path))
     parts: list[str] = []
+
+    # 1) try normal text extraction first
     for page in reader.pages:
         try:
             parts.append(page.extract_text() or "")
         except Exception:
             parts.append("")
-    return "\n".join(parts)
+
+    text = "\n".join(parts).strip()
+    if text:
+        return text
+
+    # 2) OCR fallback for scanned PDFs
+    doc = fitz.open(str(path))
+    ocr_parts: list[str] = []
+
+    for page in doc:
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        page_text = pytesseract.image_to_string(img)
+        if page_text:
+            ocr_parts.append(page_text)
+
+    return "\n".join(ocr_parts).strip()
+
+
+def extract_text_from_pdf(path: Path) -> str:
+    return extract_text_from_pdf_with_ocr(path)
 
 
 async def extract_text_from_pdf_async(path: Path) -> str:
@@ -238,6 +266,9 @@ async def extract_text_from_pdf_async(path: Path) -> str:
 
 
 def extract_text_from_image(path: Path) -> str:
+    from PIL import Image
+    import pytesseract
+
     with Image.open(path) as img:
         return pytesseract.image_to_string(img)
 
@@ -271,21 +302,23 @@ def parse_offer_fields(text: str) -> dict:
         "truck": None,
         "price": None,
         "notes": None,
+        "contact_email": None,
+        "google_maps_url": None,
     }
 
-    # OCR examples (unit-style):
-    # - "CZ-783 66 Hlubocky >>> FR-41500 MER"
-    # - "CZ-783 66 Hlubocky >> FR-41500 MER"
-    # - "CZ-783 66 Hlubocky -> FR-41500 MER"
-    # - "FR-41500" + "MER" split -> should become "FR-41500 MER"
+    email_match = re.search(
+        r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})",
+        text or "",
+    )
+    if email_match:
+        fields["contact_email"] = email_match.group(1)
+
     route_match = re.search(r"(.+?)\s*(>>>|->|>>)\s*(.+)", t_compact)
     if route_match:
         left = route_match.group(1).strip()
         sep = route_match.group(2)
         right = route_match.group(3).strip()
 
-        # If unloading is like "FR-41500" and OCR put the city right after as a separate token,
-        # ensure it is appended.
         m_right = re.match(r"^(?P<code>[A-Z]{2}-\d{3,6})(?:\s+(?P<city>[A-Z]{2,10}))?(?P<rest>\b.*)?$", right)
         if m_right and not m_right.group("city"):
             after = t_compact[route_match.end() :].strip()
@@ -310,6 +343,35 @@ def parse_offer_fields(text: str) -> dict:
         if any(k in ll for k in ["unloading", "delivery", "rozładunek", "rozladunek"]):
             fields["unloading"] = lines[idx]
             break
+
+    if not (fields.get("route") or "").strip():
+        from_raw: str | None = None
+        to_raw: str | None = None
+
+        for l in lines:
+            m_from = re.search(r"(?i)\bfrom\s+(.+)", l)
+            if m_from:
+                candidate = m_from.group(1).strip()
+                if candidate:
+                    from_raw = candidate
+                    break
+
+        for l in lines:
+            m_to = re.search(r"(?i)\bto\s+(.+)", l)
+            if m_to:
+                candidate = m_to.group(1).strip()
+                if candidate:
+                    to_raw = candidate
+                    break
+
+        if from_raw and not (fields.get("loading") or "").strip():
+            fields["loading"] = from_raw
+
+        if to_raw and not (fields.get("unloading") or "").strip():
+            fields["unloading"] = to_raw
+
+        if from_raw and to_raw:
+            fields["route"] = f"{from_raw} >>> {to_raw}".strip()
 
     timing_hint_patterns = [
         r"\b\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?\b",
@@ -361,13 +423,8 @@ def parse_offer_fields(text: str) -> dict:
             fields["truck"] = kw.upper() if kw in {"ftl", "ltl"} else kw
             break
 
-    # OCR examples (unit-style):
-    # - "2 400 €" -> "2400€"
-    # - "2400EUR" -> "2400 EUR"
-    # - "2,400€"  -> "2400€"
-    # - "Price 1350" -> "1350" (fallback)
     price_pattern = re.compile(
-        r"(?i)\b(\d{2,6}(?:[.,]\d{1,2})?)\s*(€|eur|euro|pln|zl|zł)\b"
+        r"(?i)(?<!\w)(\d{2,6}(?:[.,]\d{1,2})?)\s*(€|eur|euro|pln|zl|zł)(?!\w)"
     )
     price_matches = list(price_pattern.finditer(t_compact))
     if price_matches:
@@ -449,7 +506,11 @@ def format_clean_offer(details: dict) -> str:
             return ""
         m = re.search(r"(.+?)\s*(>>>|->|>>)\s*(.+)", r)
         if m:
-            return f"{m.group(1).strip()} >>> {m.group(3).strip()}"
+            r = f"{m.group(1).strip()} >>> {m.group(3).strip()}"
+
+        r = re.sub(r"(>>>\s*[A-Z]{2}-\d{3,6}\s+[A-Za-z\-]+).*", r"\1", r)
+        if re.search(r"(?i)\b(loading|ftl|price|no\s+change)\b", r):
+            r = re.sub(r"(?i)\b(loading|ftl|price|no\s+change)\b.*", "", r).strip()
         return r
 
     def normalize_price(price: str | None) -> str:
@@ -492,7 +553,7 @@ def format_clean_offer(details: dict) -> str:
     truck = str(details.get("truck") or "").strip()
     weight = str(details.get("weight") or "").strip()
     if truck and weight:
-        truck_weight_line = f"{truck} {weight}"
+        truck_weight_line = f"{truck} / {weight}"
     elif truck:
         truck_weight_line = truck
     elif weight:
@@ -504,9 +565,18 @@ def format_clean_offer(details: dict) -> str:
     if not notes_line or notes_line == "-":
         notes_line = "No change"
 
-    price_line = normalize_price(str(details.get("price")) if details.get("price") else None)
+    price_value = details.get("price")
+    price_line = normalize_price(price_value) if price_value else "-"
 
-    return "\n".join([route, loading_line, truck_weight_line, notes_line, price_line])
+    return "\n".join(
+        [
+            route or "-",
+            loading_line or "-",
+            truck_weight_line or "-",
+            notes_line or "No change",
+            price_line or "-",
+        ]
+    )
 
 
 def format_offer(fields: dict) -> str:
@@ -529,18 +599,224 @@ def format_offer(fields: dict) -> str:
     )
 
 
+def build_google_maps_url(loading: str | None, unloading: str | None) -> str | None:
+    if not loading or not unloading:
+        return None
+    from urllib.parse import quote_plus
+
+    return f"https://www.google.com/maps/dir/{quote_plus(loading)}/{quote_plus(unloading)}"
+
+
+def normalize_route_for_maps(route: str | None) -> str:
+    r = (route or "").strip()
+    if not r:
+        return ""
+
+    m = re.search(r"(.+?)\s*(>>>|->|>>)\s*(.+)", r)
+    if m:
+        r = f"{m.group(1).strip()} >>> {m.group(3).strip()}"
+
+    r = re.sub(
+        r"(?i)\b(loading|pickup|delivery|unloading|ftl|ltl|price|no\s+change)\b.*",
+        "",
+        r,
+    ).strip()
+    r = re.sub(r"\s+", " ", r).strip()
+    return r
+
+
+def extract_route_points_for_maps(details: dict) -> tuple[str | None, str | None]:
+    route = normalize_route_for_maps(details.get("route"))
+    if route and ">>>" in route:
+        left, right = route.split(">>>", 1)
+        return left.strip(), right.strip()
+
+    loading = details.get("loading")
+    unloading = details.get("unloading")
+
+    if loading:
+        loading = re.sub(
+            r"^\s*(loading|pickup|collection|załadunek|zaladunek)\s*[:\-–—]*\s*",
+            "",
+            str(loading),
+            flags=re.IGNORECASE,
+        ).strip()
+
+    if unloading:
+        unloading = re.sub(
+            r"^\s*(unloading|delivery|rozładunek|rozladunek)\s*[:\-–—]*\s*",
+            "",
+            str(unloading),
+            flags=re.IGNORECASE,
+        ).strip()
+
+    return loading or None, unloading or None
+
+
+def remove_price_from_offer(offer_text: str) -> str:
+    if not offer_text:
+        return offer_text
+
+    lines = offer_text.splitlines()
+    cleaned: list[str] = []
+
+    for line in lines:
+        l = line.lower()
+        if "€" in l or "eur" in l or "price" in l:
+            continue
+        cleaned.append(line)
+
+    return "\n".join(cleaned).strip()
+
+
+def normalize_trailer_for_sheet(truck_value: str | None) -> str:
+    s = str(truck_value or "").strip().lower()
+
+    if not s:
+        return ""
+
+    if s in {"tautliner", "curtain", "standard", "ftl"}:
+        return "Tautliner"
+
+    if s in {"frigo", "reefer"}:
+        return "Frigo"
+
+    if s in {"box", "taut/frigo/box", "taut frigo box"}:
+        return "Taut/Frigo/Box"
+
+    return str(truck_value or "").strip()
+
+
+def build_sheet_payload(fields: dict, final_offer: str, google_maps_url: str | None) -> dict:
+    route = str(fields.get("route") or "").strip()
+    loading_place = ""
+    unloading_place = ""
+
+    if route and ">>>" in route:
+        left, right = route.split(">>>", 1)
+        loading_place = left.strip()
+        unloading_place = right.strip()
+    else:
+        loading_place = str(fields.get("loading") or "").strip()
+        unloading_place = str(fields.get("unloading") or "").strip()
+
+    clean_offer = remove_price_from_offer(final_offer)
+
+    return {
+        "loading_date": str(fields.get("date") or "").strip(),
+        "loading_place": loading_place,
+        "unloading_place": unloading_place,
+        "unloading_date": "",
+        "offer": clean_offer,
+        "type_of_trailer": normalize_trailer_for_sheet(fields.get("truck")),
+        "price": str(fields.get("price") or "").strip(),
+        "contact_email": str(fields.get("contact_email") or "").strip(),
+        "google_map": google_maps_url or "",
+    }
+
+
+async def export_to_google_sheets(payload: dict) -> dict | None:
+    if not GOOGLE_SHEETS_WEBHOOK_URL:
+        logger.warning("GOOGLE_SHEETS_WEBHOOK_URL is missing")
+        return None
+
+    logger.info("GOOGLE_SHEETS_WEBHOOK_URL=%s", GOOGLE_SHEETS_WEBHOOK_URL)
+    logger.info("GOOGLE_SHEETS_EXPORT_PAYLOAD=%s", payload)
+
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            r = await client.post(
+                GOOGLE_SHEETS_WEBHOOK_URL,
+                json=payload,
+                headers={"Content-Type": "application/json; charset=utf-8"},
+            )
+
+        logger.info("GOOGLE_SHEETS_RESPONSE_STATUS=%s", r.status_code)
+        logger.info("GOOGLE_SHEETS_RESPONSE_TEXT=%s", r.text)
+
+        r.raise_for_status()
+
+        try:
+            return r.json()
+        except Exception:
+            return {"ok": True, "raw_text": r.text}
+
+    except Exception as e:
+        logger.exception("Google Sheets export failed: %s", str(e))
+        return None
+
+
 OPENAI_SYSTEM_PROMPT = """
-You are a logistics assistant. Extract freight offer details from messy text (OCR/PDF/email).
-Return ONLY JSON that matches the schema. If missing, use null. Keep values short.
-Rules:
-- route: "AAA >>> BBB" when possible.
-- loading/unloading: locations, ideally "CC-POSTCODE City" if present.
-- date: keep as-is (tomorrow, 04.03, Monday, etc.)
-- truck: short (FTL/LTL/tautliner/mega/reefer/van, etc.)
-- weight: keep as-is (12t, 24000 kg, etc.)
-- price: keep as-is with currency (2400€, 1350 EUR, etc.)
-- notes: brief constraints (no change, ADR, no reefer, etc.)
+You are a logistics assistant. Extract freight offer details from messy, unstructured text (OCR/PDF/email/chat).
+
+Return ONLY JSON that matches the schema EXACTLY. Use null for missing fields. Keep values short and clean.
+
+Core extraction rules:
+- Recognize routes even when written as free text, e.g. patterns like:
+  - "from X" / "to Y"
+  - "load from X" / "deliver to Y"
+  - "pickup X" / "delivery Y"
+- If loading/unloading can be inferred from from/to style text, fill both fields.
+- If possible, always build:
+  route = "AAA >>> BBB"
+
+Location normalization rules (very important):
+- Normalize country names to country codes (use the code in the final location string):
+  - Czech Republic / Czechia / CZ -> CZ
+  - France / FR -> FR
+  - Germany / DE -> DE
+  - Poland / PL -> PL
+  - Netherlands / NL -> NL
+  - Belgium / BE -> BE
+  - Austria / AT -> AT
+  - Italy / IT -> IT
+  - Spain / ES -> ES
+- If you see a pattern like "CZ 78366 Hlubocky" or "CZ-78366 Hlubocky", normalize it to:
+  - "CZ-783 66 Hlubocky" (split 5 digits as 3+2)
+- If you see "France 41500 MER" or "MER France 41500", normalize it to:
+  - "FR-41500 MER"
+- Preferred normalized location format:
+  - "CC-POSTCODE City" (e.g. "FR-41500 MER")
+- Keep city uppercase only if the input is uppercase; otherwise keep original casing.
+
+Field rules:
+- loading/unloading: short location strings after normalization.
+- date: keep as-is (tomorrow, today, 04.03, Monday, etc.).
+- truck: keep concise (FTL/LTL/tautliner/mega/reefer/van, etc.).
+- weight: keep as-is (12t, 24000 kg, etc.).
+- price: keep the amount with currency (2400€, 2400 EUR, 1350 eur, etc.).
+- notes: brief constraints only (no change, ADR, temp, etc.).
+
+Examples:
+
+Example 1
+Input:
+Load tomorrow from Hlubocky CZ 78366
+to MER France 41500
+12t tautliner
+price 2400 eur
+mail: stefan.fockers@kraftverkehr-emsland.de
+Output JSON:
+{"loading":"CZ-783 66 Hlubocky","unloading":"FR-41500 MER","date":"tomorrow","truck":"tautliner","weight":"12t","price":"2400 EUR","notes":null,"route":"CZ-783 66 Hlubocky >>> FR-41500 MER"}
+
+Example 2
+Input:
+Pickup: PL 62-800 Kalisz
+Delivery DE 28195 Bremen
+FTL 24t
+1450€
+Output JSON:
+{"loading":"PL-62800 Kalisz","unloading":"DE-28195 Bremen","date":null,"truck":"FTL","weight":"24t","price":"1450€","notes":null,"route":"PL-62800 Kalisz >>> DE-28195 Bremen"}
+
+Example 3
+Input:
+NL-3011 Rotterdam -> BE Antwerpen 2000
+LTL 800kg
+price: 350 eur
+Output JSON:
+{"loading":"NL-3011 Rotterdam","unloading":"BE-2000 Antwerpen","date":null,"truck":"LTL","weight":"800kg","price":"350 EUR","notes":null,"route":"NL-3011 Rotterdam >>> BE-2000 Antwerpen"}
 """
+
 
 OPENAI_JSON_SCHEMA = {
     "name": "freight_offer",
@@ -563,11 +839,40 @@ OPENAI_JSON_SCHEMA = {
 }
 
 
+def merge_offer_fields(regex_fields: dict, ai_fields: dict) -> dict:
+    result = dict(regex_fields or {})
+    priority_keys = {"loading", "unloading", "route"}
+    for key, value in (ai_fields or {}).items():
+        if key not in result:
+            continue
+        current = result.get(key)
+
+        if value is None or str(value).strip() == "":
+            continue
+
+        if key in priority_keys:
+            result[key] = value
+            continue
+
+        if current is None or str(current).strip() == "" or str(current).strip() == "-":
+            result[key] = value
+    return result
+
+
+def looks_normalized_location(value: str | None) -> bool:
+    s = (value or "").strip()
+    if not s:
+        return False
+
+    return bool(re.search(r"\b[A-Z]{2}-\d{3,6}\b", s))
+
+
 def needs_ai(fields: dict) -> bool:
     def _has(value) -> bool:
         if value is None:
             return False
         s = str(value).strip()
+
         if not s:
             return False
         if s == "-":
@@ -581,6 +886,18 @@ def needs_ai(fields: dict) -> bool:
         return True
     if not (_has(fields.get("loading")) and _has(fields.get("unloading"))):
         return True
+
+    loading = str(fields.get("loading") or "").strip()
+    if loading and not looks_normalized_location(loading):
+        return True
+
+    unloading = str(fields.get("unloading") or "").strip()
+    if unloading and not looks_normalized_location(unloading):
+        return True
+
+    route = str(fields.get("route") or "").strip()
+    if route and not re.search(r"\b[A-Z]{2}-\d{3}(?:\s?\d{2,3})?\b", route):
+        return True
     return False
 
 
@@ -593,24 +910,135 @@ async def openai_parse_offer(text: str) -> dict:
     def _call():
         resp = openai_client.responses.create(
             model=OPENAI_MODEL,
-            input=[
-                {"role": "system", "content": [{"type": "text", "text": OPENAI_SYSTEM_PROMPT}]},
-                {"role": "user", "content": [{"type": "text", "text": text}]},
-            ],
-            response_format={"type": "json_schema", "json_schema": OPENAI_JSON_SCHEMA},
-            timeout=20,  # DEBUG TEMP
+            instructions=OPENAI_SYSTEM_PROMPT,
+            input=text,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": OPENAI_JSON_SCHEMA["name"],
+                    "schema": OPENAI_JSON_SCHEMA["schema"],
+                    "strict": OPENAI_JSON_SCHEMA["strict"],
+                }
+            },
+            timeout=20,
         )
+
         raw = getattr(resp, "output_text", None)
         if not raw:
-            raise RuntimeError("OpenAI returned empty output_text")
+            raise RuntimeError(f"OpenAI returned empty output_text. Full response: {resp}")
         return raw
 
     raw_json = await anyio.to_thread.run_sync(_call)
     return json.loads(raw_json)
 
 
+def looks_like_offer(text: str) -> bool:
+    if not text:
+        return False
+
+    t = text.lower()
+
+    keywords = [
+        ">>>",
+        "->",
+        "loading",
+        "delivery",
+        "pickup",
+        "unloading",
+        "ftl",
+        "ltl",
+        "t",
+        "kg",
+        "eur",
+        "€",
+        "price",
+    ]
+
+    return any(k in t for k in keywords)
+
+
 async def handle_text(chat_id: int, text: str, source: str):
+    started_at = time.perf_counter()
+    if not looks_like_offer(text):
+        await tg_send_message(
+            chat_id,
+            "Hello! 👋\n\nSend me a freight offer text, photo or PDF and I will convert it into a clean transport offer.",
+        )
+        return
+
     fields = parse_offer_fields(text)
+    logger.info("TIMING parse_offer_fields=%.3fs", time.perf_counter() - started_at)
+
+    logger.info(
+        "needs_ai=%s source=%s fields_before_ai=%s",
+        needs_ai(fields),
+        source,
+        fields,
+    )
+
+    if needs_ai(fields) and openai_client:
+        ai_started = time.perf_counter()
+        logger.info("AI fallback triggered source=%s", source)
+        try:
+            ai_fields = await openai_parse_offer(text)
+            logger.info("AI_FIELDS=%s", ai_fields)
+            fields = merge_offer_fields(fields, ai_fields)
+            logger.info("FIELDS_AFTER_AI_MERGE=%s", fields)
+            logger.info(
+                "TIMING ai_fallback_total=%.3fs",
+                time.perf_counter() - ai_started,
+            )
+        except Exception as e:
+            logger.exception("AI fallback failed: %s", str(e))
+            logger.info(
+                "TIMING ai_fallback_failed_after=%.3fs",
+                time.perf_counter() - ai_started,
+            )
+            await tg_send_message(
+                chat_id,
+                f"⚠️ AI fallback failed: {type(e).__name__}: {str(e)}",
+            )
+
+    if not (fields.get("contact_email") or "").strip():
+        email_match = re.search(
+            r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})",
+            text or "",
+        )
+        if email_match:
+            fields["contact_email"] = email_match.group(1)
+
+    loading_for_maps, unloading_for_maps = extract_route_points_for_maps(fields)
+    google_maps_url = build_google_maps_url(loading_for_maps, unloading_for_maps)
+
+    final_offer = format_clean_offer(fields)
+
+    sheet_payload = build_sheet_payload(fields, final_offer, google_maps_url)
+    logger.info("SHEET_PAYLOAD=%s", sheet_payload)
+
+    sheet_result = await export_to_google_sheets(sheet_payload)
+    logger.info("SHEET_EXPORT_RESULT=%s", sheet_result)
+
+    if sheet_result is None:
+        logger.warning("SHEET_EXPORT_RESULT is None")
+    else:
+        logger.info("SHEET_EXPORT_OK=%s", sheet_result)
+
+    contact_email = fields.get("contact_email")
+    if contact_email or google_maps_url:
+        logger.info(
+            "TIMING handle_text_total_before_send=%.3fs",
+            time.perf_counter() - started_at,
+        )
+        await tg_send_message(
+            chat_id,
+            "✅ Offer:\n"
+            + final_offer
+            + "\n\n📧 Contact email: "
+            + (contact_email or "-")
+            + "\n🗺 Google Maps: "
+            + (google_maps_url or "-"),
+        )
+        return
 
     logger.info(
         "handle_text source=%s route=%s price=%s loading=%s unloading=%s",
@@ -621,13 +1049,16 @@ async def handle_text(chat_id: int, text: str, source: str):
         bool((fields.get("unloading") or "").strip()),
     )
 
-    logger.info("OpenAI TEMP DISABLED")
-
     logger.info("Sending final offer to chat_id=%s", chat_id)
-    await tg_send_message(chat_id, "✅ Offer:\n" + format_clean_offer(fields))
+    logger.info(
+        "TIMING handle_text_total_before_send=%.3fs",
+        time.perf_counter() - started_at,
+    )
+    await tg_send_message(chat_id, "✅ Offer:\n" + final_offer)
 
 
 async def send_text_extraction_preview(chat_id: int, path: Path):
+    started_at = time.perf_counter()
     await tg_send_message(chat_id, "📄 Saved. Reading text...")
 
     suffix = path.suffix.lower()
@@ -647,6 +1078,12 @@ async def send_text_extraction_preview(chat_id: int, path: Path):
         logger.exception("Text extraction failed: %s", str(path))
         await tg_send_message(chat_id, f"⚠️ Error extracting text: {type(e).__name__}: {str(e)}")
         return
+
+    logger.info(
+        "TIMING extraction_total=%.3fs path=%s",
+        time.perf_counter() - started_at,
+        str(path),
+    )
 
     preview = preview_text(text)
     if not preview:
@@ -860,6 +1297,17 @@ async def set_webhook():
     return {"ok": True, "result": result, "webhook_url": WEBHOOK_URL}
 
 
+@app.get("/telegram/set-webhook")
+async def set_webhook_get():
+    result = await tg_set_webhook()
+    return {
+        "ok": True,
+        "result": result,
+        "webhook_url": WEBHOOK_URL,
+        "has_secret": bool(WEBHOOK_SECRET),
+    }
+
+
 @app.post("/telegram/get-me")
 async def telegram_get_me():
     return await tg_api_post("getMe", {})
@@ -879,25 +1327,33 @@ async def telegram_webhook(
     # Проверяем секретный заголовок (если задан WEBHOOK_SECRET)
     if WEBHOOK_SECRET:
         if x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
-            raise HTTPException(status_code=401, detail="Invalid secret token")
+            return {"ok": True}
     try:
-        update = await request.json()
+        data = await request.json()
     except Exception:
         logger.exception("Failed to parse Telegram update JSON")
         return {"ok": True}
 
-    if not isinstance(update, dict):
-        logger.info("Telegram update is not a dict: %s", type(update).__name__)
+    if not isinstance(data, dict):
+        logger.info("Telegram update is not a dict: %s", type(data).__name__)
         return {"ok": True}
 
+    update_id = data.get("update_id")
+    msg = data.get("message") or {}
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    text = msg.get("text", "")
+    logger.info("Webhook accepted update")
+    logger.info("Webhook accepted update_id=%s chat_id=%s text=%r", update_id, chat_id, text)
+
     try:
-        path = save_update_json(update)
+        path = save_update_json(data)
         logger.info("Saved update JSON: %s", str(path))
     except Exception:
         logger.exception("Failed to save update JSON")
 
     try:
-        background_tasks.add_task(process_telegram_update, update)
+        background_tasks.add_task(process_telegram_update, data)
         logger.info("Scheduled process_telegram_update")
     except Exception:
         logger.exception("Failed to schedule background task")

@@ -1,6 +1,15 @@
 .env
+
 .venv/
 env/
+
 __pycache__/
 *.pyc
+*.pyo
+
 .vscode/
+
+data/inbox/
+data/logs/
+
+.DS_Store
